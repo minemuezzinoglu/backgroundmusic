@@ -1,0 +1,674 @@
+---
+title: "Analysis(cleaned)"
+output: html_document
+date: "2025-10-04"
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(data.table)
+library(readr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(sjPlot)
+library(rstatix)
+library(afex)
+library(gghalves)
+library(ggridges)
+library(ggpubr)
+library(effectsize)
+setwd("/Users/minemuezzinoglu/Desktop/FYRP Part3")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r data loading and cleaning}
+# Load participant files
+
+data_files <- list.files(path = "harder", pattern = "^S.*\\.csv$", full.names = TRUE)
+df <- rbindlist(lapply(data_files, fread), fill = TRUE) %>%
+  select(participant, Story, Condition, text, corrAns, key_resp_4.keys, key_resp_4.corr) %>%
+  mutate(SNR = "Minus10", key_resp_4.corr = as.numeric(key_resp_4.corr))
+
+# Remove excluded participants
+remove <- c("S211","S205","S130","S126","S011","S208",   # musicians
+            "S188","S166","S100","S018",                 # hearing
+            "S017","S025","S027","S043","S057","S058","S068","S078","S107","S122",
+            "S143","S144","S147","S154","S155","S167","S170","S182","S192","S203",
+            "S217","S220","S221","S223","S228","S233",   # no English
+            "S138","S067","S110")                        # missing data
+df <- df %>%
+  filter(!participant %in% remove, !is.na(corrAns), corrAns != "")
+
+```
+
+
+```{r relabel conditions}
+df <- df %>%
+  mutate(Condition = dplyr::recode(Condition,
+    "Music"        = "Original",
+    "Pitch"        = "Pitch scrambled",
+    "Onset"        = "Rhythm jittered",
+    "Pitch_Onset"  = "Pitch + Rhythm",
+    "Reverse_Music"= "Reverse music",
+    "Silent"       = "Silent"),
+    Condition = factor(Condition,
+       levels = c("Original","Pitch scrambled","Rhythm jittered","Pitch + Rhythm","Reverse music","Silent"))
+  )
+```
+
+```{r main analyses: glmer models}
+# Set reference levels
+df$Condition <- relevel(df$Condition, ref = "Original")
+df$participant <- factor(df$participant)
+df$Story <- factor(df$Story)
+df$text <- factor(df$text)
+
+# Main model: Accuracy ~ Condition
+hard_model <- glmer(
+  key_resp_4.corr ~ Condition + (Condition | participant) + (Condition | Story/text),
+  data = df, 
+  family = binomial,
+  control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2.5e5))
+)
+
+summary(hard_model)
+
+# Export results
+tab_model(hard_model,
+          show.ci = FALSE, show.re.var = FALSE, show.icc = TRUE, show.stat = TRUE,
+          dv.labels = "Story Comprehension Accuracy",
+          pred.labels = c("Intercept (Original)",
+                          "Pitch scrambled", "Rhythm jittered", "Pitch + Rhythm",
+                          "Reverse music", "Silent"),
+          title = "GLMER (Harder SNR): Accuracy by Background Condition")
+tab_model(hard_model, file = "hard_model_results.doc")
+
+# Post-hoc tests
+emm <- emmeans(hard_model, ~ Condition)
+pairs(emm, adjust = "bonferroni")
+
+
+# Define orthogonal contrasts across 6 conditions
+df$Condition <- factor(df$Condition,
+                                levels = c("Original","Pitch scrambled","Rhythm jittered",
+                                           "Pitch + Rhythm","Reverse music","Silent"))
+
+orth1 <- c(-1/5, -1/5, -1/5, -1/5, -1/5, 1)   # Silent vs all sounds
+orth2 <- c(1, -1/4, -1/4, -1/4, -1/4, 0)      # Original vs non-original sounds
+orth3 <- c(0, -1/3, -1/3, -1/3, 1, 0)         # Reverse vs scrambled
+orth4 <- c(0, -1, 1/2, 1/2, 0, 0)             # single vs double scrambled
+orth5 <- c(0, 0, 1, -1, 0, 0)                 # rhythm vs pitch scrambled
+
+contrast_matrix <- cbind(orth1, orth2, orth3, orth4, orth5)
+contrasts(df$Condition) <- contrast_matrix
+colnames(contrasts(df$Condition)) <- 
+  c("Silent_vs_Sound","Original_vs_Sounds","Reverse_vs_Scrambled",
+    "Single_vs_DoubleScrambled","Rhythm_vs_Pitch")
+
+model_orth <- glmer(
+  key_resp_4.corr ~ Condition + (Condition | participant) + (Condition | Story/text),
+  data = df, family = binomial,
+  control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2.5e5))
+)
+
+summary(model_orth)
+
+tab_model(model_orth,
+          show.ci = FALSE, show.re.var = FALSE, show.icc = TRUE, show.stat = TRUE,
+          dv.labels = "Story Comprehension Accuracy",
+          pred.labels = c("Intercept",
+                          "Silent vs Sound","Original vs Sounds","Reverse vs Scrambled",
+                          "Single vs Double Scrambled","Rhythm vs Pitch"),
+          title = "GLMER with Orthogonal Contrasts")
+tab_model(model_orth, file = "hard_model_orthogonal.doc")
+
+```
+
+```{r accuracy plots}
+accuracy_stats <- df %>%
+  group_by(participant, Condition) %>%
+  summarise(mean_acc = mean(key_resp_4.corr, na.rm = TRUE), .groups="drop")
+
+group_sd_summary <- accuracy_stats %>%
+  group_by(Condition) %>%
+  summarise(mean_acc = mean(mean_acc), sd_acc = sd(mean_acc), .groups="drop")
+
+colors <- c("Original"="tomato","Pitch scrambled"="turquoise",
+            "Rhythm jittered"="pink","Pitch + Rhythm"="#8A2BE2",
+            "Reverse music"="steelblue","Silent"="darkgreen")
+
+accuracy_plot <- ggplot(accuracy_stats, aes(x=Condition, y=mean_acc, fill=Condition)) +
+  geom_boxplot(outlier.shape=NA, width=0.6) +
+  geom_jitter(width=0.15, alpha=0.2, size=1) +
+  geom_point(data=group_sd_summary, aes(x=Condition, y=mean_acc),
+             color="black", shape=18, size=3, inherit.aes=FALSE) +
+  geom_errorbar(data=group_sd_summary,
+                aes(x=Condition, ymin=mean_acc-sd_acc, ymax=mean_acc+sd_acc),
+                width=0.2, color="black", inherit.aes=FALSE) +
+  scale_fill_manual(values=colors) +
+  coord_cartesian(ylim=c(0.25,1)) +
+  labs(x=NULL, y="Average Accuracy") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        axis.title=element_text(size=16),
+        axis.text=element_text(size=14),
+        legend.position="none")
+
+ggsave("accuracy_by_condition_harder.png", accuracy_plot, width=8, height=6, dpi=300)
+
+```
+
+
+```{r accuracy plot}
+# Plot order (applied to a copy so the model contrasts are untouched)
+cond_order <- c("Silent", "Original", "Reverse music",
+                "Rhythm jittered", "Pitch scrambled", "Pitch + Rhythm")
+
+plot_data <- df %>%
+  group_by(participant, Condition) %>%
+  summarise(acc = mean(key_resp_4.corr, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Condition = factor(as.character(Condition), levels = cond_order))
+
+set.seed(1)
+plot_data <- plot_data %>%
+  mutate(x_jit = as.numeric(Condition) - 0.18 + runif(n(), -0.07, 0.07))
+# Within-subject 95% CIs (Cousineau-Morey) 
+
+grand_mean <- mean(plot_data$acc)
+J <- n_distinct(plot_data$Condition)   # number of conditions (6)
+
+ws_summary <- plot_data %>%
+  group_by(participant) %>%
+  mutate(acc_norm = acc - mean(acc) + grand_mean) %>%
+  group_by(Condition) %>%
+  summarise(mean_acc = mean(acc),
+            n  = n(),
+            se = sd(acc_norm) / sqrt(n) * sqrt(J / (J - 1)),
+            ci = se * qt(.975, n - 1),
+            .groups = "drop")
+
+colors <- c("Silent" = "darkgreen", "Original" = "tomato",
+            "Reverse music" = "steelblue", "Rhythm jittered" = "pink",
+            "Pitch scrambled" = "turquoise", "Pitch + Rhythm" = "#8A2BE2")
+
+accuracy_plot <- ggplot(plot_data, aes(x = Condition, y = acc)) +
+  geom_line(aes(group = participant), color = "grey50",
+            alpha = 0.12, linewidth = 0.3) +
+  geom_point(aes(color = Condition), alpha = 0.25, size = 1) +
+  geom_errorbar(data = ws_summary,
+                aes(x = Condition, ymin = mean_acc - ci, ymax = mean_acc + ci),
+                width = 0.15, linewidth = 0.8, inherit.aes = FALSE) +
+  geom_point(data = ws_summary,
+             aes(x = Condition, y = mean_acc, fill = Condition),
+             shape = 21, size = 4, color = "black", inherit.aes = FALSE) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) +
+  scale_x_discrete(labels = c("Silent" = "Silent",
+                              "Original" = "Original music",
+                              "Reverse music" = "Reversed",
+                              "Rhythm jittered" = "Rhythm-jittered",
+                              "Pitch scrambled" = "Pitch-scrambled",
+                              "Pitch + Rhythm" = "Combined")) +
+  coord_cartesian(ylim = c(0.25, 1)) +
+  labs(x = NULL, y = "Comprehension accuracy") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.position = "none")
+
+accuracy_plot
+ggsave("accuracy_by_condition_harder.png", accuracy_plot,
+       width = 8, height = 6, dpi = 300)
+
+#simpler plot
+ws_summary_grouped <- ws_summary %>%
+  mutate(
+    group = case_when(
+      Condition == "Silent"         ~ "No background",
+      Condition == "Pitch + Rhythm" ~ "Little structure",
+      TRUE                          ~ "Structure in ≥1 dimension"
+    ),
+    group = factor(group, levels = c("No background",
+                                     "Structure in ≥1 dimension",
+                                     "Little structure")),
+    Condition = factor(Condition,
+                       levels = c("Silent", "Original", "Reverse music",
+                                  "Rhythm jittered", "Pitch scrambled",
+                                  "Pitch + Rhythm"))
+  )
+
+orig_mean <- ws_summary$mean_acc[ws_summary$Condition == "Original"]
+
+accuracy_plot_grouped <- ggplot(ws_summary_grouped,
+                                aes(x = Condition, y = mean_acc, color = Condition)) +
+  geom_hline(yintercept = orig_mean, linetype = "dotted", color = "grey50") +
+  geom_errorbar(aes(ymin = mean_acc - ci, ymax = mean_acc + ci),
+                width = 0.15, linewidth = 0.8) +
+  geom_point(size = 4) +
+  facet_grid(~ group, scales = "free_x", space = "free_x") +
+  scale_color_manual(values = colors) +
+  scale_x_discrete(labels = c("Silent"          = "Silent",
+                              "Original"        = "Original",
+                              "Reverse music"   = "Reversed",
+                              "Rhythm jittered" = "Rhythm-jittered",
+                              "Pitch scrambled" = "Pitch-scrambled",
+                              "Pitch + Rhythm"  = "Combined")) +
+  labs(x = NULL, y = "Story comprehension accuracy") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 12),
+        strip.background = element_blank(),
+        legend.position = "none",
+        panel.grid.major.x = element_blank())
+
+accuracy_plot_grouped
+
+```
+
+
+
+```{r bmrq integration}
+
+# Load BMRQ file
+harder_BMRQ <- read.csv("hardercondition_BMRQ_new.csv", header = TRUE)
+
+# Scale BMRQ
+harder_BMRQ$centered_BMRQ <- scale(harder_BMRQ$BMRQ, scale = TRUE)
+
+# Keep relevant columns
+harder_BMRQ_subset <- harder_BMRQ %>%
+  select(participant, BMRQ, centered_BMRQ,
+         jazz, familiarity, liking_this_music, liking_jazz, listening_jazz_freq,
+         music, pitch, onset, reverse, pitch_onset)
+
+# Merge into harder_data
+df <- merge(df, harder_BMRQ_subset, by = "participant", all.x = TRUE)
+
+# Reset reference level
+df$Condition <- relevel(df$Condition, ref = "Original")
+
+# GLMER with Condition × BMRQ
+hard_model_bmrq <- glmer(
+  key_resp_4.corr ~ Condition * centered_BMRQ + 
+    (Condition | participant) + (Condition | Story/text),
+  data = df, family = binomial,
+  control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2.5e5))
+)
+
+summary(hard_model_bmrq)
+
+# Export pretty table
+tab_model(hard_model_bmrq,
+          show.re.var = TRUE, show.icc = TRUE, show.r2 = TRUE,
+          show.ci = FALSE, show.se = TRUE,
+          dv.labels = "Accuracy (Hard Trials)",
+          pred.labels = c(
+            "(Intercept)",
+            "Pitch + Rhythm","Pitch scrambled","Rhythm jittered",
+            "Reverse music","Silent",
+            "BMRQ (centered)",
+            "Pitch + Rhythm × BMRQ","Pitch scrambled × BMRQ","Rhythm jittered × BMRQ",
+            "Reverse music × BMRQ","Silent × BMRQ"
+          ),
+          title = "GLMER: Accuracy predicted by Condition × BMRQ")
+tab_model(hard_model_bmrq, file="hard_model_bmrq.doc")
+
+# Post-hoc contrasts
+# This fixes BMRQ at its mean (0) explicitly, which should match your model output
+emm_bmrq <- emmeans(hard_model_bmrq, ~ Condition, type="response", at = list(centered_BMRQ = 0))
+pairs(emm_bmrq, adjust = "bonferroni")
+
+```
+
+```{r BMRQ distribution}
+# Summary statistics of BMRQ (participant-level)
+summary(harder_BMRQ$BMRQ)
+sd(harder_BMRQ$BMRQ, na.rm = TRUE)
+
+# Histogram
+hist(harder_BMRQ$BMRQ,
+     breaks = 15,
+     main = "Distribution of BMRQ Scores",
+     xlab = "BMRQ Total Score",
+     col = "lightblue", border = "black")
+
+low_cutoff <- quantile(harder_BMRQ$BMRQ, probs = 0.25, na.rm = TRUE)
+low_hedonics <- harder_BMRQ %>% filter(BMRQ <= low_cutoff)
+
+n_low <- nrow(low_hedonics)
+cat("Number of low-hedonia participants:", n_low, "\n")
+
+```
+
+```{r liking ratings by condition}
+# Convert BMRQ ratings into long format
+ratings <- harder_BMRQ_subset %>%
+  select(participant,
+         Original = music,
+         `Pitch scrambled` = pitch,
+         `Rhythm jittered` = onset,
+         `Reverse music` = reverse,
+         `Pitch + Rhythm` = pitch_onset) %>%
+  pivot_longer(cols = -participant, names_to = "Condition", values_to = "Rating") %>%
+  mutate(Condition = factor(Condition,
+    levels = c("Original","Reverse music", "Pitch scrambled","Rhythm jittered","Pitch + Rhythm")))
+
+# Summary stats
+summary_stats <- ratings %>%
+  group_by(Condition) %>%
+  summarise(mean_rating = mean(Rating, na.rm=TRUE),
+            se_rating = sd(Rating, na.rm=TRUE)/sqrt(n()), .groups="drop")
+
+# Plot
+colors <- c("Original"="tomato","Pitch scrambled"="turquoise",
+            "Rhythm jittered"="pink","Pitch + Rhythm"="#8A2BE2",
+            "Reverse music"="steelblue")
+
+liking_plot <- ggplot(summary_stats, aes(x=Condition, y=mean_rating, fill=Condition)) +
+  geom_bar(stat="identity", width=0.7) +
+  geom_errorbar(aes(ymin=mean_rating-se_rating, ymax=mean_rating+se_rating), width=0.25) +
+  scale_fill_manual(values=colors) +
+  coord_cartesian(ylim=c(1,5)) +
+  labs(x=NULL, y="Average Rating of Background Sounds (1–5)") +
+  theme_bw() +
+  scale_x_discrete(labels = c("Silent" = "Silent",
+                              "Original" = "Original music",
+                              "Reverse music" = "Reversed",
+                              "Rhythm jittered" = "Rhythm-jittered",
+                              "Pitch scrambled" = "Pitch-scrambled",
+                              "Pitch + Rhythm" = "Combined")) +
+  theme(axis.text.x=element_text(angle=45,hjust=1),
+        axis.title=element_text(size=16),
+        axis.text=element_text(size=14),
+        legend.position="none")
+
+ggsave("liking_ratings_harder.png", liking_plot, width=8, height=6, dpi=300)
+
+
+```
+
+
+
+
+
+```{r sound ratings}
+# Friedman test (non-parametric within-subjects)
+friedman_data <- ratings %>%
+  group_by(participant) %>%
+  filter(all(!is.na(Rating))) %>%
+  ungroup() %>%
+  distinct(participant, Condition, .keep_all=TRUE)
+
+friedman_test <- friedman.test(Rating ~ Condition | participant, data=friedman_data)
+friedman_test
+
+pairwise_results <- pairwise.wilcox.test(
+  friedman_data$Rating, friedman_data$Condition,
+  p.adjust.method="bonferroni", paired=TRUE
+)
+pairwise_results
+
+# Wilcoxon tests vs Silent (Accuracy, harder SNR only)
+pair_data <- df %>%
+  filter(Condition %in% c("Silent","Original","Pitch scrambled","Rhythm jittered","Pitch + Rhythm","Reverse music")) %>%
+  group_by(participant, Condition) %>%
+  summarise(mean_acc = mean(key_resp_4.corr, na.rm=TRUE), .groups="drop") %>%
+  pivot_wider(names_from=Condition, values_from=mean_acc)
+
+wilcox.test(pair_data$Silent, pair_data$`Original`, paired=TRUE)
+wilcox.test(pair_data$Silent, pair_data$`Pitch scrambled`, paired=TRUE)
+wilcox.test(pair_data$Silent, pair_data$`Rhythm jittered`, paired=TRUE)
+wilcox.test(pair_data$Silent, pair_data$`Pitch + Rhythm`, paired=TRUE)
+wilcox.test(pair_data$Silent, pair_data$`Reverse music`, paired=TRUE)
+
+```
+
+```{r anova on average accuracy}
+## Average accuracy per participant × condition (harder SNR only)
+anova_data <- df %>%
+  group_by(participant, Condition) %>%
+  summarise(mean_acc = mean(key_resp_4.corr, na.rm = TRUE),
+    .groups = "drop")
+
+anova_data <- anova_data %>% left_join(harder_BMRQ_subset, by = "participant")
+
+
+anova_acc <- aov_ez(
+  id = "participant",
+  dv = "mean_acc",
+  data = anova_data,
+  within = "Condition",
+  between_covariates = "centered_BMRQ",
+  anova_table = list(
+    correction = "GG",
+    es = "pes"))
+
+summary(anova_acc)
+effectsize::eta_squared(anova_acc, partial = TRUE)
+
+emm_cond <- emmeans(anova_acc, ~ Condition)
+pairs(emm_cond, adjust = "bonferroni")
+```
+
+```{r kendall's rank correlations}
+# Compute mean accuracy per participant per condition
+kendall_data <- df %>%
+  group_by(participant, Condition) %>%
+  summarise(mean_acc = mean(key_resp_4.corr, na.rm = TRUE), .groups = "drop") %>%
+  left_join(harder_BMRQ_subset %>% select(participant, BMRQ), by = "participant")
+
+# Run Kendall correlation for each condition
+kendall_results <- kendall_data %>%
+  group_by(Condition) %>%
+  summarise(
+    tau = cor.test(mean_acc, BMRQ, method = "kendall")$estimate,
+    p_value = cor.test(mean_acc, BMRQ, method = "kendall")$p.value,
+    .groups = "drop"
+  )
+
+kendall_results
+
+
+```
+
+```{r masking check}
+library(tidyverse)
+library(afex)   # for aov_ez, handles repeated-measures ANOVA cleanly
+
+masking <- read_csv("/Users/minemuezzinoglu/Documents/MATLAB/figures_new/EnergeticMaskingResults.csv")
+
+# make sure Story and MaskerCondition are factors
+masking <- masking %>%
+  mutate(
+    Story = factor(Story),
+    MaskerCondition = factor(MaskerCondition)
+  )
+
+# repeated-measures ANOVA: MaskerCondition as within-story factor
+masking_anova <- aov_ez(
+  id = "Story",
+  dv = "PercentMasked",
+  within = "MaskerCondition",
+  data = masking
+)
+
+masking_emm <- emmeans(masking_anova, ~ MaskerCondition)
+pairs(masking_emm, adjust = "bonferroni")
+
+```
+
+```{r insert demographics}
+library(readxl)
+library(patchwork)
+
+# ---- demographics ----
+demo_raw <- read_excel("harder_data_pt3_demographics.xlsx")
+
+demo <- demo_raw %>%
+  rename(
+    participant           = `Participant number (to be entered by Experimenter)`,
+    age                    = Age,
+    gender                 = `Gender (self-identified)`,
+    music_training_years   = `How many years of formal training on a musical instrument (including voice) have you had in your lifetime?`,
+    live_music_events      = `How many live music events have you attended in the past twelve months as an audience member?`,
+    study_quiet_actual     = `How often do you study in these environments? - Quiet space`,
+    study_coffee_actual    = `How often do you study in these environments? - Coffee shop or comparable`,
+    study_music_actual     = `How often do you study in these environments? - With music in the background`,
+    study_quiet_pref       = `How often would you prefer to study in these environments? - Quiet space`,
+    study_coffee_pref      = `How often would you prefer to study in these environments? - Coffee shop or comparable`,
+    study_music_pref       = `How often would you prefer to study in these environments? - With music in the background`
+  ) %>%
+  filter(!is.na(participant)) %>%                # drops 2 trailing summary rows
+  mutate(participant = as.character(participant)) %>%
+  filter(!participant %in% remove) %>%            # reuse your existing exclusion list
+  mutate(study_music_diff = study_music_pref - study_music_actual) %>%
+  select(participant, age, gender, music_training_years, live_music_events,
+         study_quiet_actual, study_coffee_actual, study_music_actual,
+         study_quiet_pref, study_coffee_pref, study_music_pref, study_music_diff)
+
+# ---- accuracy: overall and by condition ----
+acc_overall <- df %>%
+  group_by(participant) %>%
+  summarise(overall_acc = mean(key_resp_4.corr, na.rm = TRUE), .groups = "drop")
+
+acc_by_cond <- df %>%
+  group_by(participant, Condition) %>%
+  summarise(mean_acc = mean(key_resp_4.corr, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Condition, values_from = mean_acc, names_prefix = "acc_")
+
+# ---- one row per participant: demographics + BMRQ + STOMP-R + jazz items + accuracy ----
+corr_data <- harder_BMRQ %>%
+  select(participant, BMRQ, Reflective_Complex, Intense_Rebellious, Upbeat_Conventional,
+         Energetic_Rhythmic, Mellow, Unpretentious, Sophisticated, Intense, Contemporary,
+         jazz, familiarity, liking_this_music, liking_jazz, listening_jazz_freq) %>%
+  left_join(demo, by = "participant") %>%
+  left_join(acc_overall, by = "participant") %>%
+  left_join(acc_by_cond, by = "participant")
+
+# ---- scatterplots: continuous demographic/questionnaire vars vs overall accuracy ----
+scatter_vars <- c("age", "music_training_years", "live_music_events",
+                   "study_quiet_actual", "study_coffee_actual", "study_music_actual",
+                   "study_quiet_pref", "study_coffee_pref", "study_music_pref",
+                   "study_music_diff", "BMRQ", "Reflective_Complex", "Intense_Rebellious",
+                   "Upbeat_Conventional", "Energetic_Rhythmic", "Mellow", "Unpretentious",
+                   "Sophisticated", "Intense", "Contemporary")
+
+plot_list <- lapply(scatter_vars, function(v) {
+  ggplot(corr_data, aes(x = .data[[v]], y = overall_acc)) +
+    geom_point(alpha = 0.5, color = "steelblue") +
+    geom_smooth(method = "lm", se = TRUE, color = "tomato") +
+    labs(x = v, y = "Overall Accuracy") +
+    theme_bw()
+})
+names(plot_list) <- scatter_vars
+
+wrap_plots(plot_list, ncol = 4)
+
+# ---- jazz-liking vars vs accuracy, BY CONDITION ----
+jazz_by_cond <- corr_data %>%
+  select(participant, jazz, familiarity, liking_this_music, liking_jazz, listening_jazz_freq,
+         starts_with("acc_")) %>%
+  pivot_longer(starts_with("acc_"), names_to = "condition", values_to = "acc", names_prefix = "acc_") %>%
+  pivot_longer(c(jazz, familiarity, liking_this_music, liking_jazz, listening_jazz_freq),
+               names_to = "jazz_measure", values_to = "rating")
+
+ggplot(jazz_by_cond, aes(x = rating, y = acc)) +
+  geom_jitter(width = 0.1, alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "tomato") +
+  facet_grid(jazz_measure ~ condition, scales = "free_x") +
+  labs(x = "Rating", y = "Accuracy") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 8))
+
+# ---- study habits (actual + preferred) vs accuracy, BY CONDITION ----
+study_by_cond <- corr_data %>%
+  select(participant,
+         quiet_actual = study_quiet_actual, quiet_pref = study_quiet_pref,
+         coffee_actual = study_coffee_actual, coffee_pref = study_coffee_pref,
+         music_actual = study_music_actual, music_pref = study_music_pref,
+         starts_with("acc_")) %>%
+  pivot_longer(starts_with("acc_"), names_to = "condition", values_to = "acc", names_prefix = "acc_") %>%
+  pivot_longer(c(quiet_actual, quiet_pref, coffee_actual, coffee_pref, music_actual, music_pref),
+               names_to = "item", values_to = "rating") %>%
+  separate(item, into = c("environment", "type"), sep = "_")
+
+# full grid: every environment x actual/pref, every condition
+ggplot(study_by_cond, aes(x = rating, y = acc)) +
+  geom_jitter(width = 0.1, alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "tomato") +
+  facet_grid(environment + type ~ condition, scales = "free_x") +
+  labs(x = "Rating (1-5)", y = "Accuracy") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 7))
+
+# ---- coffee shop specifically: does coffee-shop preference/habit relate to accuracy in a particular condition? ----
+study_by_cond %>%
+  filter(environment == "coffee") %>%
+  ggplot(aes(x = rating, y = acc)) +
+  geom_jitter(width = 0.1, alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "tomato") +
+  facet_grid(type ~ condition, scales = "free_x") +
+  labs(x = "Coffee Shop Rating (1-5)", y = "Accuracy",
+       title = "Coffee shop study habit/preference vs. accuracy by condition") +
+  theme_bw()
+
+library(tibble)
+plot_corr_heatmap_rect <- function(data, predictor_vars, outcome_vars, title) {
+  cor_mat <- cor(data[c(predictor_vars, outcome_vars)],
+                  use = "pairwise.complete.obs", method = "spearman")
+  
+  cor_sub <- cor_mat[predictor_vars, outcome_vars, drop = FALSE]
+  
+  cor_long <- as.data.frame(cor_sub) %>%
+    rownames_to_column("predictor") %>%
+    pivot_longer(-predictor, names_to = "condition", values_to = "r") %>%
+    mutate(predictor = factor(predictor, levels = rev(predictor_vars)),
+           condition = factor(condition, levels = outcome_vars))
+  
+  ggplot(cor_long, aes(x = condition, y = predictor, fill = r)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+    scale_fill_gradient2(low = "steelblue", mid = "white", high = "tomato",
+                          midpoint = 0, limits = c(-1, 1)) +
+    labs(x = NULL, y = NULL, fill = "Spearman\nr", title = title) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+acc_cond_vars <- paste0("acc_", cond_order)
+acc_cond_vars <- acc_cond_vars[acc_cond_vars %in% names(corr_data)]
+
+# study habits
+plot_corr_heatmap_rect(corr_data,
+  predictor_vars = c("study_quiet_actual", "study_coffee_actual", "study_music_actual",
+                      "study_quiet_pref", "study_coffee_pref", "study_music_pref"),
+  outcome_vars = acc_cond_vars,
+  title = "Study Habits & Preferences vs. Accuracy")
+ggsave("heatmap_study_habits_rect.png", width = 8, height = 5, dpi = 300)
+
+# STOMP-R
+plot_corr_heatmap_rect(corr_data,
+  predictor_vars = c("Reflective_Complex", "Intense_Rebellious", "Upbeat_Conventional",
+                      "Energetic_Rhythmic", "Mellow", "Unpretentious", "Sophisticated",
+                      "Intense", "Contemporary"),
+  outcome_vars = acc_cond_vars,
+  title = "STOMP-R Subscales vs. Accuracy")
+ggsave("heatmap_stompr_rect.png", width = 8, height = 6, dpi = 300)
+
+# music preferences / experience
+plot_corr_heatmap_rect(corr_data,
+  predictor_vars = c("music_training_years", "live_music_events", "familiarity",
+                      "liking_this_music", "liking_jazz", "listening_jazz_freq", "BMRQ"),
+  outcome_vars = acc_cond_vars,
+  title = "Music Preferences & Experience vs. Accuracy")
+ggsave("heatmap_music_preferences_rect.png", width = 8, height = 5, dpi = 300)
+```
+
+```
